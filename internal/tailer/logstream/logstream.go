@@ -34,13 +34,18 @@ var (
 
 // LogStream.
 type LogStream interface {
-	LastReadTime() time.Time // Return the time when the last log line was read from the source
-	Stop()                   // Ask to gracefully stop the stream; e.g. stream keeps reading until EOF and then completes work.
-	IsComplete() bool        // True if the logstream has completed work and cannot recover.  The caller should clean up this logstream, creating a new logstream on a pathname if necessary.
+	LastReadTime() time.Time        // Return the time when the last log line was read from the source
+	Stop()                          // Ask to gracefully stop the stream; e.g. stream keeps reading until EOF and then completes work.
+	IsComplete() bool               // True if the logstream has completed work and cannot recover.  The caller should clean up this logstream, creating a new logstream on a pathname if necessary.
+	Lines() <-chan *logline.LogLine // Returns the output channel of this LogStream.
 }
 
-// defaultReadBufferSize the size of the buffer for reading bytes into.
-const defaultReadBufferSize = 4096
+// defaultReadBufferSize the size of the buffer for reading bytes for files.
+//
+// Anecdotally the maximum file read buffer is 4GiB, but thats way too massive.
+const defaultReadBufferSize = 131072
+
+const stdinPattern = "-"
 
 var (
 	ErrUnsupportedURLScheme = errors.New("unsupported URL scheme")
@@ -58,10 +63,9 @@ const (
 
 // New creates a LogStream from the file object located at the absolute path
 // `pathname`.  The LogStream will watch `ctx` for a cancellation signal, and
-// notify the `wg` when it is Done.  Log lines will be sent to the `lines`
-// channel.  `seekToStart` is only used for testing and only works for regular
-// files that can be seeked.
-func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, lines chan<- *logline.LogLine, oneShot OneShotMode) (LogStream, error) {
+// notify the `wg` when it is Done.  `oneShot` is used for testing and only
+// works for regular files that can be seeked.
+func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, oneShot OneShotMode) (LogStream, error) {
 	if wg == nil {
 		return nil, ErrNeedsWaitgroup
 	}
@@ -76,39 +80,48 @@ func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname st
 	default:
 		glog.V(2).Infof("%v: %q in path pattern %q, treating as path", ErrUnsupportedURLScheme, u.Scheme, pathname)
 	case "unixgram":
-		return newDgramStream(ctx, wg, waker, u.Scheme, u.Path, lines)
+		return newDgramStream(ctx, wg, waker, u.Scheme, u.Path, oneShot)
 	case "unix":
-		return newSocketStream(ctx, wg, waker, u.Scheme, u.Path, lines, oneShot)
+		return newSocketStream(ctx, wg, waker, u.Scheme, u.Path, oneShot)
 	case "tcp":
-		return newSocketStream(ctx, wg, waker, u.Scheme, u.Host, lines, oneShot)
+		return newSocketStream(ctx, wg, waker, u.Scheme, u.Host, oneShot)
 	case "udp":
-		return newDgramStream(ctx, wg, waker, u.Scheme, u.Host, lines)
+		return newDgramStream(ctx, wg, waker, u.Scheme, u.Host, oneShot)
 	case "", "file":
 		path = u.Path
 	}
-	var fi os.FileInfo
-	if path == "-" {
-		fi, err = os.Stdin.Stat()
+	if IsStdinPattern(path) {
+		fi, err := os.Stdin.Stat()
 		if err != nil {
 			logErrors.Add(path, 1)
 			return nil, err
 		}
-	} else {
-		fi, err = os.Stat(path)
-		if err != nil {
-			logErrors.Add(path, 1)
-			return nil, err
-		}
+		return newPipeStream(ctx, wg, waker, path, fi)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		logErrors.Add(path, 1)
+		return nil, err
 	}
 	switch m := fi.Mode(); {
 	case m.IsRegular():
-		return newFileStream(ctx, wg, waker, path, fi, lines, oneShot)
+		return newFileStream(ctx, wg, waker, path, fi, oneShot)
 	case m&os.ModeType == os.ModeNamedPipe:
-		return newPipeStream(ctx, wg, waker, path, fi, lines)
+		return newPipeStream(ctx, wg, waker, path, fi)
 	// TODO(jaq): in order to listen on an existing socket filepath, we must unlink and recreate it
 	// case m&os.ModeType == os.ModeSocket:
-	// 	return newSocketStream(ctx, wg, waker, pathname, lines)
+	// 	return newSocketStream(ctx, wg, waker, pathname)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedFileType, pathname)
 	}
+}
+
+func IsStdinPattern(pattern string) bool {
+	if pattern == stdinPattern {
+		return true
+	}
+	if pattern == "/dev/stdin" {
+		return true
+	}
+	return false
 }

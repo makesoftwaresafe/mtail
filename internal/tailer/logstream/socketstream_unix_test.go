@@ -36,13 +36,18 @@ func TestSocketStreamReadCompletedBecauseSocketClosed(t *testing.T) {
 			default:
 				t.Fatalf("bad scheme %s", scheme)
 			}
-			lines := make(chan *logline.LogLine, 1)
+
 			ctx, cancel := context.WithCancel(context.Background())
-			waker, awaken := waker.NewTest(ctx, 1)
+			waker, awaken := waker.NewTest(ctx, 1, "stream")
 
 			sockName := scheme + "://" + addr
-			ss, err := logstream.New(ctx, &wg, waker, sockName, lines, logstream.OneShotDisabled)
+			ss, err := logstream.New(ctx, &wg, waker, sockName, logstream.OneShotEnabled)
 			testutil.FatalIfErr(t, err)
+
+			expected := []*logline.LogLine{
+				{Context: context.TODO(), Filename: addr, Line: "1"},
+			}
+			checkLineDiff := testutil.ExpectLinesReceivedNoDiff(t, expected, ss.Lines())
 
 			s, err := net.Dial(scheme, addr)
 			testutil.FatalIfErr(t, err)
@@ -50,27 +55,20 @@ func TestSocketStreamReadCompletedBecauseSocketClosed(t *testing.T) {
 			_, err = s.Write([]byte("1\n"))
 			testutil.FatalIfErr(t, err)
 
-			awaken(0) // Sync past read
+			awaken(0, 0) // Sync past read
 
 			// Close the socket to signal to the socketStream to shut down.
 			testutil.FatalIfErr(t, s.Close())
 
-			ss.Stop() // stop after connection closes
-
 			wg.Wait()
-			close(lines)
 
-			received := testutil.LinesReceived(lines)
-			expected := []*logline.LogLine{
-				{context.TODO(), addr, "1"},
-			}
-			testutil.ExpectNoDiff(t, expected, received, testutil.IgnoreFields(logline.LogLine{}, "Context"))
-
-			cancel()
+			checkLineDiff()
 
 			if !ss.IsComplete() {
 				t.Errorf("expecting socketstream to be complete because socket closed")
 			}
+
+			cancel() // stop after connection closes
 		}))
 	}
 }
@@ -91,13 +89,18 @@ func TestSocketStreamReadCompletedBecauseCancel(t *testing.T) {
 			default:
 				t.Fatalf("bad scheme %s", scheme)
 			}
-			lines := make(chan *logline.LogLine, 1)
+
 			ctx, cancel := context.WithCancel(context.Background())
-			waker, awaken := waker.NewTest(ctx, 1)
+			waker, awaken := waker.NewTest(ctx, 1, "stream")
 
 			sockName := scheme + "://" + addr
-			ss, err := logstream.New(ctx, &wg, waker, sockName, lines, logstream.OneShotDisabled)
+			ss, err := logstream.New(ctx, &wg, waker, sockName, logstream.OneShotDisabled)
 			testutil.FatalIfErr(t, err)
+
+			expected := []*logline.LogLine{
+				{Context: context.TODO(), Filename: addr, Line: "1"},
+			}
+			checkLineDiff := testutil.ExpectLinesReceivedNoDiff(t, expected, ss.Lines())
 
 			s, err := net.Dial(scheme, addr)
 			testutil.FatalIfErr(t, err)
@@ -105,18 +108,12 @@ func TestSocketStreamReadCompletedBecauseCancel(t *testing.T) {
 			_, err = s.Write([]byte("1\n"))
 			testutil.FatalIfErr(t, err)
 
-			awaken(0) // Sync past read to ensure we read
+			awaken(0, 0) // Sync past read to ensure we read
 
 			cancel() // This cancellation should cause the stream to shut down immediately.
-
 			wg.Wait()
-			close(lines)
 
-			received := testutil.LinesReceived(lines)
-			expected := []*logline.LogLine{
-				{context.TODO(), addr, "1"},
-			}
-			testutil.ExpectNoDiff(t, expected, received, testutil.IgnoreFields(logline.LogLine{}, "Context"))
+			checkLineDiff()
 
 			if !ss.IsComplete() {
 				t.Errorf("expecting socketstream to be complete because cancel")

@@ -4,9 +4,10 @@ on:
   # goreleaser is put into snapshot mode when not on a tag
   pull_request:
   merge_group:
-  # Run when a tag is created, i.e. after the tag-release workflow.
-  # https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#create
-  create:
+  # Run when a tag is pushed.
+  push:
+    tags:
+      - v*
 
 env:
   REGISTRY: ghcr.io
@@ -35,12 +36,12 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      - uses: docker/login-action@v3.1.0
+      - uses: docker/login-action@v3.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: goreleaser/goreleaser-action@v5
+      - uses: goreleaser/goreleaser-action@v6
         id: goreleaser
         with:
           version: latest
@@ -131,7 +132,7 @@ jobs:
     strategy:
       matrix: ${{ fromJSON(needs.goreleaser.outputs.image_subjects) }}
     steps:
-      - uses: docker/login-action@v3.1.0
+      - uses: docker/login-action@v3.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

@@ -17,8 +17,7 @@ import (
 )
 
 type pipeStream struct {
-	ctx   context.Context
-	lines chan<- *logline.LogLine
+	lines chan *logline.LogLine
 
 	pathname string // Given name for the underlying named pipe on the filesystem
 
@@ -29,8 +28,8 @@ type pipeStream struct {
 
 // newPipeStream creates a new stream reader for Unix Pipes.
 // `pathname` must already be verified as clean.
-func newPipeStream(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, fi os.FileInfo, lines chan<- *logline.LogLine) (LogStream, error) {
-	ps := &pipeStream{ctx: ctx, pathname: pathname, lastReadTime: time.Now(), lines: lines}
+func newPipeStream(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, fi os.FileInfo) (LogStream, error) {
+	ps := &pipeStream{pathname: pathname, lastReadTime: time.Now(), lines: make(chan *logline.LogLine)}
 	if err := ps.stream(ctx, wg, waker, fi); err != nil {
 		return nil, err
 	}
@@ -44,12 +43,25 @@ func (ps *pipeStream) LastReadTime() time.Time {
 }
 
 func pipeOpen(pathname string) (*os.File, error) {
-	if pathname == "-" {
+	if IsStdinPattern(pathname) {
 		return os.Stdin, nil
 	}
 	// Open in nonblocking mode because the write end of the pipe may not have started yet.
 	return os.OpenFile(pathname, os.O_RDONLY|syscall.O_NONBLOCK, 0o600) // #nosec G304 -- path already validated by caller
 }
+
+// The read buffer size for pipes.
+//
+// Before Linux 2.6.11, the capacity of a pipe was the same as the
+// system page size (e.g., 4096 bytes on i386).  Since Linux 2.6.11,
+// the pipe capacity is 16 pages (i.e., 65,536 bytes in a system
+// with a page size of 4096 bytes).  Since Linux 2.6.35, the default
+// pipe capacity is 16 pages, but the capacity can be queried and
+// set using the fcntl(2) F_GETPIPE_SZ and F_SETPIPE_SZ operations.
+// See fcntl(2) for more information.
+//
+// https://man7.org/linux/man-pages/man7/pipe.7.html
+const defaultPipeReadBufferSize = 131072
 
 func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, _ os.FileInfo) error {
 	fd, err := pipeOpen(ps.pathname)
@@ -57,16 +69,16 @@ func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 		logErrors.Add(ps.pathname, 1)
 		return err
 	}
-	glog.V(2).Infof("opened new pipe %v", fd)
-	b := make([]byte, defaultReadBufferSize)
+	glog.V(2).Infof("stream(%s): opened new pipe %v", ps.pathname, fd)
+	b := make([]byte, defaultPipeReadBufferSize)
 	partial := bytes.NewBufferString("")
 	var total int
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer func() {
-			glog.V(2).Infof("%v: read total %d bytes from %s", fd, total, ps.pathname)
-			glog.V(2).Infof("%v: closing file descriptor", fd)
+			glog.V(2).Infof("stream(%s): read total %d bytes", ps.pathname, total)
+			glog.V(2).Infof("stream(%s): closing file descriptor %v", ps.pathname, fd)
 			err := fd.Close()
 			if err != nil {
 				logErrors.Add(ps.pathname, 1)
@@ -75,6 +87,7 @@ func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 			logCloses.Add(ps.pathname, 1)
 			ps.mu.Lock()
 			ps.completed = true
+			close(ps.lines)
 			ps.mu.Unlock()
 		}()
 		ctx, cancel := context.WithCancel(ctx)
@@ -83,12 +96,11 @@ func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 
 		for {
 			n, err := fd.Read(b)
-			glog.V(2).Infof("%v: read %d bytes, err is %v", fd, n, err)
+			glog.V(2).Infof("stream(%s): read %d bytes, err is %v", ps.pathname, n, err)
 
 			if n > 0 {
 				total += n
-				//nolint:contextcheck
-				decodeAndSend(ps.ctx, ps.lines, ps.pathname, n, b[:n], partial)
+				decodeAndSend(ctx, ps.lines, ps.pathname, n, b[:n], partial)
 				// Update the last read time if we were able to read anything.
 				ps.mu.Lock()
 				ps.lastReadTime = time.Now()
@@ -100,12 +112,12 @@ func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 				if partial.Len() > 0 {
 					sendLine(ctx, ps.pathname, partial, ps.lines)
 				}
-				glog.V(2).Infof("%v: exiting, stream has error %s", fd, err)
+				glog.V(2).Infof("stream(%s): exiting, stream has error %s", ps.pathname, err)
 				return
 			}
 
 			// Wait for wakeup or termination.
-			glog.V(2).Infof("%v: waiting", fd)
+			glog.V(2).Infof("stream(%s): waiting", ps.pathname)
 			select {
 			case <-ctx.Done():
 				// Exit immediately; cancelled context is going to cause the
@@ -114,7 +126,7 @@ func (ps *pipeStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 				return
 			case <-waker.Wake():
 				// sleep until next Wake()
-				glog.V(2).Infof("%v: Wake received", fd)
+				glog.V(2).Infof("stream(%s): Wake received", ps.pathname)
 			}
 		}
 	}()
@@ -128,6 +140,11 @@ func (ps *pipeStream) IsComplete() bool {
 }
 
 // Stop implements the Logstream interface.
-// Calling Stop on a PipeStream is a no-op; PipeStreams always read until the pipe is closed, which is what calling Stop means on a Logstream.
+// Calling Stop on a PipeStream is a no-op; PipeStreams always read until the input pipe is closed, which is what calling Stop means on a Logstream.
 func (ps *pipeStream) Stop() {
+}
+
+// Lines implements the LogStream interface, returning the output lines channel.
+func (ps *pipeStream) Lines() <-chan *logline.LogLine {
+	return ps.lines
 }
